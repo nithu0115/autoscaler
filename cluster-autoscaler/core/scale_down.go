@@ -1100,6 +1100,31 @@ func (sd *ScaleDown) scheduleDeleteEmptyNodes(emptyNodes []*apiv1.Node, client k
 	recorder kube_record.EventRecorder, readinessMap map[string]bool,
 	candidateNodeGroups map[string]cloudprovider.NodeGroup) ([]*apiv1.Node, errors.AutoscalerError) {
 	deletedNodes := []*apiv1.Node{}
+	emptyNodesLen := len(emptyNodes)
+	var wg sync.WaitGroup
+
+	wg.Add(emptyNodesLen)
+	for _, node := range emptyNodes {
+        type returnChan struct {
+        	deletedNodesChan []*apiv1.Node
+        	errorChan errors.AutoscalerError
+		}
+
+		ch := make(chan returnChan)
+		go func(nodeToTaint *apiv1.Node, ch chan returnChan) ([]*apiv1.Node, errors.AutoscalerError) {
+			taintErr := deletetaint.MarkToBeDeleted(node, client, sd.context.CordonNodeBeforeTerminate)
+			if taintErr != nil {
+				recorder.Eventf(node, apiv1.EventTypeWarning, "ScaleDownFailed", "failed to mark the node as toBeDeleted/unschedulable: %v", taintErr)
+			    res := new(returnChan)
+			    res.deletedNodesChan = deletedNodes
+			    res.errorChan = errors.ToAutoscalerError(errors.ApiCallError, taintErr)
+			    ch <- *res
+			}
+			return nil, nil
+		}(node, ch)
+	}
+	wg.Wait()
+
 	for _, node := range emptyNodes {
 		klog.V(0).Infof("Scale-down: removing empty node %s", node.Name)
 		sd.context.LogRecorder.Eventf(apiv1.EventTypeNormal, "ScaleDownEmpty", "Scale-down: removing empty node %s", node.Name)
@@ -1108,11 +1133,6 @@ func (sd *ScaleDown) scheduleDeleteEmptyNodes(emptyNodes []*apiv1.Node, client k
 		if !found {
 			return deletedNodes, errors.NewAutoscalerError(
 				errors.CloudProviderError, "failed to find node group for %s", node.Name)
-		}
-		taintErr := deletetaint.MarkToBeDeleted(node, client, sd.context.CordonNodeBeforeTerminate)
-		if taintErr != nil {
-			recorder.Eventf(node, apiv1.EventTypeWarning, "ScaleDownFailed", "failed to mark the node as toBeDeleted/unschedulable: %v", taintErr)
-			return deletedNodes, errors.ToAutoscalerError(errors.ApiCallError, taintErr)
 		}
 		deletedNodes = append(deletedNodes, node)
 		go func(nodeToDelete *apiv1.Node, nodeGroupForDeletedNode cloudprovider.NodeGroup, evictByDefault bool) {
